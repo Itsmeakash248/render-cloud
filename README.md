@@ -28,6 +28,19 @@ Inputs: `slug` (`auto` = folder touched by the last commit), `kind`
 
 A push that adds or changes `videos/**` auto-dispatches with the defaults.
 
+### Staging hygiene
+
+`videos/` is transient: only `.gitkeep` (and its README) should remain between
+runs. A 2026-11-21 audit found two old projects still staged —
+`lunik-heist-1959` (250 MB) and `venetian-mirror-syndicate-2026` (86 MB). Both
+were removed from the current tree; the Venetian deliverable already exists as
+a release and the Lunik master lives in `RenderedLabs/videos/`. History was not
+rewritten because both trees had already been public; new runs purge their own
+slug automatically.
+
+Unreferenced root PNGs from the repo's first import were moved to
+[`docs/samples/`](docs/samples/).
+
 ---
 
 ## HyperFrames
