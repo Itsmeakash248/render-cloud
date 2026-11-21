@@ -40,9 +40,19 @@ node tools/cloud-render.mjs dispatch <slug>  # 20 runners
 node tools/cloud-render.mjs download <slug>  # release -> videos/<slug>/renders/
 ```
 
-The staged project keeps its `index.html` and assets. The workflow reads
-`data-duration`, plans 20 time chunks, runs `hyperframes render --workers 4` on
-each runner, then stitches the chunks losslessly.
+Or stage any HyperFrames folder directly:
+
+```bash
+node tools/stage-hyperframes.mjs /path/to/project <slug>
+gh workflow run render.yml -R Itsmeakash248/render-cloud \
+  -f slug=<slug> -f kind=hyperframes -f chunks=20 -f workers=4
+```
+
+`stage-hyperframes.mjs` copies the source only (no `renders/`, `review/`,
+`node_modules/` or generated caches). The workflow reads `data-duration`, installs
+the HyperFrames version the project pins in `package.json`, plans time chunks,
+runs `hyperframes render --workers 4` on each runner, then stitches the chunks
+losslessly.
 
 ---
 
@@ -81,6 +91,17 @@ audio, and (if `share: true`) encodes a 720p share copy.
 
 Audio must already be compressed (m4a/mp3) and under ~50 MB; WAV masters stay
 local.
+
+Concept Carousel shorts have a helper that reads the live duration, encodes the
+WAV bed to AAC, writes `cloud.json`, and calls `stage-canvas.mjs`:
+
+```bash
+cd /home/akash/Studio/concept-carousel
+node tools/cloud-short.mjs shorts/s01e02-what-if-the-moon-was-a-mirror
+```
+
+Proven on the hub: the 34 s vertical short rendered as 816 frames, 1080×1920,
+with a 720×1280 share copy.
 
 ---
 

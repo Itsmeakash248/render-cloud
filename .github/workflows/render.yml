@@ -76,6 +76,7 @@ jobs:
       ar: ${{ steps.d.outputs.ar }}
       audio: ${{ steps.d.outputs.audio }}
       share: ${{ steps.d.outputs.share }}
+      hf_version: ${{ steps.d.outputs.hf_version }}
       workers: ${{ steps.d.outputs.workers }}
       chunk_count: ${{ steps.d.outputs.chunk_count }}
       matrix: ${{ steps.d.outputs.matrix }}
@@ -147,7 +148,7 @@ jobs:
       - name: Install HyperFrames
         if: needs.detect.outputs.kind == 'hyperframes'
         run: |
-          npm install -g hyperframes@0.8.223
+          npm install -g "hyperframes@${{ needs.detect.outputs.hf_version }}"
           hyperframes browser ensure
       - name: Render HyperFrames chunk ${{ matrix.id }}
         if: needs.detect.outputs.kind == 'hyperframes'

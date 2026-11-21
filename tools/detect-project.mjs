@@ -123,6 +123,21 @@ function readHyperframesConfig(slug) {
       frames: 0,
     });
   }
+  // Respect the project's pinned CLI when it names one; the RenderedLabs films
+  // and the Concept Carousel ports use different HyperFrames majors.
+  let hfVersion = "0.8.223";
+  const pkgPath = path.join(VIDEOS, slug, "package.json");
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      const pinned = pkg.dependencies?.hyperframes || pkg.devDependencies?.hyperframes;
+      const inScript = JSON.stringify(pkg.scripts || {}).match(/hyperframes@([0-9][0-9.]*)/);
+      if (pinned) hfVersion = String(pinned).replace(/^[^0-9]*/, "");
+      else if (inScript) hfVersion = inScript[1];
+    } catch {
+      // malformed package.json: fall back to the hub default
+    }
+  }
   return {
     kind: "hyperframes",
     slug,
@@ -131,6 +146,7 @@ function readHyperframesConfig(slug) {
     ar: "",
     audio: "",
     share: false,
+    hf_version: hfVersion,
     nominal: duration,
     duration,
     frames: 0,
@@ -161,6 +177,7 @@ function main() {
     ar: plan.ar,
     audio: plan.audio,
     share: String(plan.share),
+    hf_version: plan.hf_version || "",
     workers: String(workers),
     chunk_count: String(plan.matrix.include.length),
     matrix: JSON.stringify(plan.matrix),
