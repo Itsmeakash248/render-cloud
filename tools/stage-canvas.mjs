@@ -29,8 +29,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const ROOT = process.cwd();
+// Resolve the hub from this script, not from the caller's cwd.
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const [projectArg, slug] = process.argv.slice(2);
 if (!projectArg || !slug) {
   console.error("usage: node tools/stage-canvas.mjs <projectDir> <slug>");
