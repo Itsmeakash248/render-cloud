@@ -95,3 +95,6 @@
 *.xls filter=lfs diff=lfs merge=lfs -text
 *.numbers filter=lfs diff=lfs merge=lfs -text
 *.pages filter=lfs diff=lfs merge=lfs -text
+# Canvas render bundles are plain blobs: cloud runners must fetch one 18 MB
+# file, not the repository's entire LFS archive.
+videos/**/bundle.tar.gz -filter -diff -merge -text

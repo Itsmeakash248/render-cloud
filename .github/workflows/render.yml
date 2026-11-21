@@ -285,6 +285,12 @@ jobs:
             exit 1
           fi
 
+          # The merge job extracted ep/ and wrote deliver/, so the worktree is dirty.
+          # filter-branch refuses to run until it is clean; the release already holds
+          # every deliverable, so the local copies can go.
+          git reset --hard HEAD
+          git clean -fdx
+
           git config user.name "render-bot"
           git config user.email "bot@users.noreply.github.com"
           export FILTER_BRANCH_SQUELCH_WARNING=1

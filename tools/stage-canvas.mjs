@@ -83,12 +83,14 @@ for (const rel of include) {
   fs.cpSync(src, dst, { recursive: true });
 }
 
-const bundlePath = path.join(tmp, "bundle.tar.gz");
+// The archive must live outside the directory being tarred.
+const bundlePath = path.join(os.tmpdir(), `bundle-${slug}-${Date.now()}.tar.gz`);
 execSync(`tar -czf "${bundlePath}" -C "${tmp}" .`, { stdio: "inherit" });
 
 const outDir = path.join(ROOT, "videos", slug);
 fs.mkdirSync(outDir, { recursive: true });
 fs.copyFileSync(bundlePath, path.join(outDir, "bundle.tar.gz"));
+fs.rmSync(bundlePath, { force: true });
 fs.writeFileSync(
   path.join(outDir, "render.json"),
   JSON.stringify({
