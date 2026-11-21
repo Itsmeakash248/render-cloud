@@ -1,0 +1,12 @@
+{
+  "name": "render-cloud",
+  "version": "1.0.0",
+  "description": "Public cloud render hub for Studio channels: HyperFrames + canvas, 20 runners x 4 workers",
+  "type": "module",
+  "scripts": {
+    "render": "node tools/render-one.mjs"
+  },
+  "dependencies": {
+    "hyperframes": "^0.8.145"
+  }
+}

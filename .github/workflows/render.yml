@@ -1,0 +1,310 @@
+name: Render Video
+
+# One public cloud render hub for every channel.
+#
+#   hyperframes  -> videos/<slug>/index.html + data-duration
+#                   RenderedLabs films, concept-carousel HyperFrames shorts
+#   canvas       -> videos/<slug>/render.json + bundle.tar.gz
+#                   Amber Margins, concept-carousel canvas shorts
+#
+# Default dispatch: 20 runners, 4 workers each.
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Project under videos/ ('auto' = the folder touched by the last commit)"
+        required: false
+        default: "auto"
+      kind:
+        description: "Renderer"
+        required: false
+        type: choice
+        options: [auto, hyperframes, canvas]
+        default: auto
+      chunks:
+        description: "Parallel runners (1–20)"
+        required: false
+        default: "20"
+      workers:
+        description: "Workers per runner (1–8)"
+        required: false
+        default: "4"
+      quality:
+        description: "HyperFrames quality (delivery | draft)"
+        required: false
+        default: "delivery"
+      crf:
+        description: "Canvas master x264 CRF"
+        required: false
+        default: "18"
+      create_release:
+        description: "Attach deliverable(s) to a GitHub Release"
+        required: false
+        type: boolean
+        default: true
+      cleanup:
+        description: "Purge staged sources + artifacts after the release is secured"
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "videos/**"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: render-${{ github.ref }}-${{ inputs.slug || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      slug: ${{ steps.d.outputs.slug }}
+      kind: ${{ steps.d.outputs.kind }}
+      output: ${{ steps.d.outputs.output }}
+      duration: ${{ steps.d.outputs.duration }}
+      nominal: ${{ steps.d.outputs.nominal }}
+      fps: ${{ steps.d.outputs.fps }}
+      frames: ${{ steps.d.outputs.frames }}
+      ar: ${{ steps.d.outputs.ar }}
+      audio: ${{ steps.d.outputs.audio }}
+      share: ${{ steps.d.outputs.share }}
+      workers: ${{ steps.d.outputs.workers }}
+      chunk_count: ${{ steps.d.outputs.chunk_count }}
+      matrix: ${{ steps.d.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Detect project and plan chunks
+        id: d
+        run: |
+          node tools/detect-project.mjs \
+            "${{ inputs.slug || 'auto' }}" \
+            "${{ inputs.kind || 'auto' }}" \
+            "${{ inputs.chunks || '20' }}" \
+            "${{ inputs.workers || '4' }}" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  render-chunk:
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: ${{ needs.detect.outputs.kind == 'hyperframes' }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Ensure FFmpeg
+        run: |
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffmpeg -version | head -1
+
+      # ── canvas ────────────────────────────────────────────────────────────
+      - name: Extract canvas bundle
+        if: needs.detect.outputs.kind == 'canvas'
+        run: |
+          mkdir -p ep
+          tar -xzf "videos/${{ needs.detect.outputs.slug }}/bundle.tar.gz" -C ep
+          test -s ep/index.html
+      - name: Render canvas chunk ${{ matrix.id }}
+        if: needs.detect.outputs.kind == 'canvas'
+        working-directory: ep
+        env:
+          AR: ${{ needs.detect.outputs.ar }}
+          CRF: ${{ inputs.crf || '18' }}
+          WORKERS: ${{ needs.detect.outputs.workers }}
+        run: |
+          OUT="$RUNNER_TEMP/chunk_${{ matrix.id }}.mp4"
+          mkdir -p "$RUNNER_TEMP"
+          node tools/capture.mjs video "$OUT" "${{ matrix.start }}" "${{ matrix.end }}" "$WORKERS"
+          test -s "$OUT"
+          N=$(ffprobe -v error -select_streams v:0 -count_packets \
+                -show_entries stream=nb_read_packets -of csv=p=0 "$OUT")
+          N=${N//[^0-9]/}
+          echo "chunk ${{ matrix.id }}: $N / ${{ matrix.frames }} frames"
+          test "$N" = "${{ matrix.frames }}"
+          echo "CHUNK_PATH=$OUT" >> "$GITHUB_ENV"
+
+      # ── hyperframes ───────────────────────────────────────────────────────
+      - name: Install HyperFrames
+        if: needs.detect.outputs.kind == 'hyperframes'
+        run: |
+          npm install -g hyperframes@0.8.223
+          hyperframes browser ensure
+      - name: Render HyperFrames chunk ${{ matrix.id }}
+        if: needs.detect.outputs.kind == 'hyperframes'
+        env:
+          QUALITY: ${{ inputs.quality || 'delivery' }}
+          WORKERS: ${{ needs.detect.outputs.workers }}
+        run: |
+          OUT="$RUNNER_TEMP/chunk_${{ matrix.id }}.mp4"
+          mkdir -p "$RUNNER_TEMP"
+          CMD="hyperframes render \"videos/${{ needs.detect.outputs.slug }}\" --workers $WORKERS --quality $QUALITY"
+          if [ -n "${{ matrix.start }}" ]; then CMD="$CMD --start ${{ matrix.start }}"; fi
+          if [ -n "${{ matrix.end }}" ]; then CMD="$CMD --end ${{ matrix.end }}"; fi
+          CMD="$CMD -o \"$OUT\""
+          echo "=== $CMD"
+          eval "$CMD"
+          test -s "$OUT"
+          echo "CHUNK_PATH=$OUT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ needs.detect.outputs.slug }}-${{ matrix.id }}
+          path: ${{ env.CHUNK_PATH }}
+          retention-days: 2
+          if-no-files-found: error
+
+  merge:
+    needs: [detect, render-chunk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SLUG: ${{ needs.detect.outputs.slug }}
+      KIND: ${{ needs.detect.outputs.kind }}
+      OUTPUT: ${{ needs.detect.outputs.output }}
+      DURATION: ${{ needs.detect.outputs.duration }}
+      AR: ${{ needs.detect.outputs.ar }}
+      AUDIO: ${{ needs.detect.outputs.audio }}
+      SHARE: ${{ needs.detect.outputs.share }}
+      FRAMES: ${{ needs.detect.outputs.frames }}
+      COUNT: ${{ needs.detect.outputs.chunk_count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Ensure FFmpeg
+        run: |
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffmpeg -version | head -1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-${{ needs.detect.outputs.slug }}-*
+          path: chunks_download
+          merge-multiple: true
+      - name: Stitch, master, share
+        run: |
+          set -euo pipefail
+          mkdir -p deliver
+          ls -lh chunks_download
+
+          if [ "$KIND" = "canvas" ]; then
+            mkdir -p ep
+            tar -xzf "videos/$SLUG/bundle.tar.gz" -C ep
+            node tools/stitch-render-chunks.mjs "$SLUG" "$COUNT" chunks_download "$RUNNER_TEMP/silent.mp4"
+            test -s "ep/$AUDIO"
+            ffmpeg -y -loglevel error -i "$RUNNER_TEMP/silent.mp4" -i "ep/$AUDIO" \
+              -map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -t "$DURATION" \
+              -movflags +faststart "deliver/${OUTPUT}-master.mp4"
+
+            if [ "$SHARE" = "true" ]; then
+              if [ "$AR" = "9x16" ]; then SCALE="720:1280"; else SCALE="1280:720"; fi
+              ffmpeg -y -loglevel error -i "deliver/${OUTPUT}-master.mp4" \
+                -vf "scale=${SCALE}:flags=lanczos" \
+                -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
+                -c:a copy -movflags +faststart "deliver/${OUTPUT}-share.mp4"
+            fi
+
+            MASTER_FRAMES=$(ffprobe -v error -select_streams v:0 -count_packets \
+              -show_entries stream=nb_read_packets -of csv=p=0 "deliver/${OUTPUT}-master.mp4" | tr -dc '0-9')
+            echo "master frames: $MASTER_FRAMES / $FRAMES"
+            test "$MASTER_FRAMES" = "$FRAMES"
+            if [ "$SHARE" = "true" ]; then
+              SHARE_FRAMES=$(ffprobe -v error -select_streams v:0 -count_packets \
+                -show_entries stream=nb_read_packets -of csv=p=0 "deliver/${OUTPUT}-share.mp4" | tr -dc '0-9')
+              test "$SHARE_FRAMES" = "$FRAMES"
+            fi
+            ffmpeg -hide_banner -nostats -i "deliver/${OUTPUT}-master.mp4" -vn \
+              -af ebur128=peak=true -f null - 2>&1 | grep -A4 -E "Integrated loudness|True peak"
+          else
+            node tools/stitch-render-chunks.mjs "$SLUG" "$COUNT" chunks_download "deliver/${OUTPUT}.mp4"
+            test -s "deliver/${OUTPUT}.mp4"
+            ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "deliver/${OUTPUT}.mp4"
+          fi
+
+          echo "── deliverables ──"
+          ls -lh deliver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deliverable-${{ needs.detect.outputs.slug }}-${{ github.run_number }}
+          path: deliver/*.mp4
+          retention-days: 30
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        id: release
+        if: inputs.create_release != false
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: deliverable-${{ needs.detect.outputs.slug }}-${{ github.run_number }}
+          name: "Cloud master: ${{ needs.detect.outputs.slug }} #${{ github.run_number }}"
+          body: |
+            **Project:** `${{ needs.detect.outputs.slug }}`
+            **Renderer:** `${{ needs.detect.outputs.kind }}`
+            **Runners:** ${{ needs.detect.outputs.chunk_count }} × ${{ needs.detect.outputs.workers }} workers
+            **Duration:** `${{ needs.detect.outputs.duration }}` s
+            **Frames:** `${{ needs.detect.outputs.frames }}`
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: deliver/*.mp4
+          draft: false
+          prerelease: false
+      - name: Purge staged sources and artifacts
+        if: inputs.cleanup != false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          SLUG: ${{ needs.detect.outputs.slug }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_OUTCOME" = "skipped" ]; then
+            echo "::notice::Release disabled - keeping staged sources and artifacts."
+            exit 0
+          fi
+          if [ "$RELEASE_OUTCOME" != "success" ]; then
+            echo "::error::Release outcome '$RELEASE_OUTCOME' - master is not secured. Skipping cleanup."
+            exit 1
+          fi
+
+          # The merge job extracted ep/ and wrote deliver/, so the worktree is dirty.
+          # filter-branch refuses to run until it is clean; the release already holds
+          # every deliverable, so the local copies can go.
+          git reset --hard HEAD
+          git clean -fdx
+
+          git config user.name "render-bot"
+          git config user.email "bot@users.noreply.github.com"
+          # Tags are not fetched by the checkout; without them the release tag would
+          # keep the staged commit (and its bundle) alive after the purge.
+          git fetch --tags --force
+          export FILTER_BRANCH_SQUELCH_WARNING=1
+          git filter-branch --force --index-filter \
+            "git rm -rf --cached --ignore-unmatch 'videos/${SLUG}'" \
+            --prune-empty --tag-name-filter cat -- --all
+          git push --force origin main
+          git push --force origin --tags || true
+          echo "History purged: videos/${SLUG} is gone from every commit."
+
+          for ARTIFACT_ID in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate -q '.artifacts[].id'); do
+            echo "Deleting artifact ${ARTIFACT_ID}"
+            gh api --method DELETE "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}" || true
+          done
