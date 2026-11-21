@@ -1,7 +1,7 @@
 {
-  "name": "renderedlabs-render",
+  "name": "render-cloud",
   "version": "1.0.0",
-  "description": "Cloud Render Runner & Video Distribution Hub for RenderedLabs",
+  "description": "Public cloud render hub for Studio channels: HyperFrames + canvas, 20 runners x 4 workers",
   "type": "module",
   "scripts": {
     "render": "node tools/render-one.mjs"

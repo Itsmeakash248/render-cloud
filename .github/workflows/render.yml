@@ -1,27 +1,50 @@
 name: Render Video
 
+# One public cloud render hub for every channel.
+#
+#   hyperframes  -> videos/<slug>/index.html + data-duration
+#                   RenderedLabs films, concept-carousel HyperFrames shorts
+#   canvas       -> videos/<slug>/render.json + bundle.tar.gz
+#                   Amber Margins, concept-carousel canvas shorts
+#
+# Default dispatch: 20 runners, 4 workers each.
+
 on:
   workflow_dispatch:
     inputs:
-      slugs:
-        description: "Target video slug(s) — comma-separated, 'all', or 'auto'"
+      slug:
+        description: "Project under videos/ ('auto' = the folder touched by the last commit)"
         required: false
         default: "auto"
-      quality:
-        description: "Render quality (delivery | draft)"
+      kind:
+        description: "Renderer"
         required: false
-        default: "delivery"
+        type: choice
+        options: [auto, hyperframes, canvas]
+        default: auto
       chunks:
-        description: "Number of parallel chunks per video (1 to 20, default 20)"
+        description: "Parallel runners (1–20)"
         required: false
         default: "20"
+      workers:
+        description: "Workers per runner (1–8)"
+        required: false
+        default: "4"
+      quality:
+        description: "HyperFrames quality (delivery | draft)"
+        required: false
+        default: "delivery"
+      crf:
+        description: "Canvas master x264 CRF"
+        required: false
+        default: "18"
       create_release:
-        description: "Create GitHub Release and attach MP4"
+        description: "Attach deliverable(s) to a GitHub Release"
         required: false
         type: boolean
         default: true
       cleanup:
-        description: "Erase staged sources + run artifacts after the master is secured as a Release asset"
+        description: "Purge staged sources + artifacts after the release is secured"
         required: false
         type: boolean
         default: true
@@ -30,308 +53,249 @@ on:
     paths:
       - "videos/**"
 
-concurrency:
-  group: render-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: render-${{ github.ref }}-${{ inputs.slug || 'auto' }}
+  cancel-in-progress: false
 
 jobs:
-  find-targets:
+  detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      has_targets: ${{ steps.set-matrix.outputs.has_targets }}
-      quality: ${{ steps.set-matrix.outputs.quality }}
-      chunks: ${{ steps.set-matrix.outputs.chunks }}
-      create_release: ${{ steps.set-matrix.outputs.create_release }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Detect video projects
-        id: set-matrix
-        run: |
-          INPUT_SLUGS="${{ inputs.slugs || 'auto' }}"
-          QUALITY="${{ inputs.quality || 'delivery' }}"
-          CHUNKS="${{ inputs.chunks || '20' }}"
-          CREATE_RELEASE="${{ inputs.create_release != false }}"
-          TARGETS=()
-
-          if [ "$INPUT_SLUGS" = "all" ]; then
-            for d in videos/*/; do
-              if [ -f "${d}index.html" ]; then
-                TARGETS+=("$(basename "$d")")
-              fi
-            done
-          elif [ "$INPUT_SLUGS" != "auto" ] && [ -n "$INPUT_SLUGS" ]; then
-            IFS=', ' read -r -a SPLIT <<< "$INPUT_SLUGS"
-            for s in "${SPLIT[@]}"; do
-              s_trimmed=$(echo "$s" | xargs)
-              if [ -n "$s_trimmed" ] && [ -f "videos/$s_trimmed/index.html" ]; then
-                TARGETS+=("$s_trimmed")
-              fi
-            done
-          else
-            CHANGED_SLUGS=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^videos/' | cut -d/ -f2 | sort -u || true)
-            for s in $CHANGED_SLUGS; do
-              if [ -f "videos/$s/index.html" ]; then
-                TARGETS+=("$s")
-              fi
-            done
-            if [ ${#TARGETS[@]} -eq 0 ]; then
-              for d in videos/*/; do
-                if [ -f "${d}index.html" ]; then
-                  TARGETS+=("$(basename "$d")")
-                fi
-              done
-            fi
-          fi
-
-          readarray -t UNIQUE_TARGETS < <(printf '%s\n' "${TARGETS[@]}" | sort -u | grep -v '^$' || true)
-
-          if [ ${#UNIQUE_TARGETS[@]} -eq 0 ]; then
-            echo "No video projects found to render."
-            echo "has_targets=false" >> $GITHUB_OUTPUT
-            echo "matrix={}" >> $GITHUB_OUTPUT
-          else
-            JSON_ARRAY=$(node -e 'console.log(JSON.stringify(process.argv.slice(1)))' "${UNIQUE_TARGETS[@]}")
-            echo "Found target videos: $JSON_ARRAY"
-            echo "has_targets=true" >> $GITHUB_OUTPUT
-            echo "matrix={\"slug\": $JSON_ARRAY}" >> $GITHUB_OUTPUT
-          fi
-          echo "quality=$QUALITY" >> $GITHUB_OUTPUT
-          echo "chunks=$CHUNKS" >> $GITHUB_OUTPUT
-          echo "create_release=$CREATE_RELEASE" >> $GITHUB_OUTPUT
-
-  plan-chunks:
-    needs: find-targets
-    if: needs.find-targets.outputs.has_targets == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.planner.outputs.matrix }}
-      target_count: ${{ steps.planner.outputs.target_count }}
+      slug: ${{ steps.d.outputs.slug }}
+      kind: ${{ steps.d.outputs.kind }}
+      output: ${{ steps.d.outputs.output }}
+      duration: ${{ steps.d.outputs.duration }}
+      nominal: ${{ steps.d.outputs.nominal }}
+      fps: ${{ steps.d.outputs.fps }}
+      frames: ${{ steps.d.outputs.frames }}
+      ar: ${{ steps.d.outputs.ar }}
+      audio: ${{ steps.d.outputs.audio }}
+      share: ${{ steps.d.outputs.share }}
+      workers: ${{ steps.d.outputs.workers }}
+      chunk_count: ${{ steps.d.outputs.chunk_count }}
+      matrix: ${{ steps.d.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: false
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - id: planner
+      - name: Detect project and plan chunks
+        id: d
         run: |
-          SLUGS='${{ needs.find-targets.outputs.matrix }}'
-          CHUNKS='${{ needs.find-targets.outputs.chunks }}'
-          QUALITY='${{ needs.find-targets.outputs.quality }}'
-          node -e '
-            const fs = require("node:fs");
-            const path = require("node:path");
-            const slugsData = JSON.parse(process.argv[1]);
-            const slugs = slugsData.slug || [];
-            const chunksCount = parseInt(process.argv[2] || "20", 10);
-            const quality = process.argv[3] || "delivery";
-            
-            const matrix = [];
-            for (const slug of slugs) {
-              const projectDir = path.join("videos", slug);
-              const indexPath = path.join(projectDir, "index.html");
-              if (!fs.existsSync(indexPath)) continue;
-              const content = fs.readFileSync(indexPath, "utf8");
-              const m = content.match(/id=["\x27]root["\x27][^>]*data-duration=["\x27]([0-9.]+)["\x27]/i) ||
-                        content.match(/data-duration=["\x27]([0-9.]+)["\x27]/i);
-              const duration = m ? parseFloat(m[1]) : 0;
-              const n = (chunksCount <= 1 || duration <= 30) ? 1 : chunksCount;
-              const step = Math.floor(duration / n);
-              for (let i = 0; i < n; i++) {
-                const start = i * step;
-                const isLast = (i === n - 1);
-                const end = isLast ? "" : (i + 1) * step;
-                matrix.push({
-                  slug: slug,
-                  id: i,
-                  start: start.toString(),
-                  end: end.toString(),
-                  total_chunks: n,
-                  quality: quality
-                });
-              }
-            }
-            console.log("matrix=" + JSON.stringify({ include: matrix }));
-            console.log("target_count=" + matrix.length);
-          ' "$SLUGS" "$CHUNKS" "$QUALITY" >> "$GITHUB_OUTPUT"
+          node tools/detect-project.mjs \
+            "${{ inputs.slug || 'auto' }}" \
+            "${{ inputs.kind || 'auto' }}" \
+            "${{ inputs.chunks || '20' }}" \
+            "${{ inputs.workers || '4' }}" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
 
   render-chunk:
-    needs: [find-targets, plan-chunks]
+    needs: detect
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix: ${{ fromJson(needs.plan-chunks.outputs.matrix) }}
-    env:
-      PRODUCER_LOW_MEMORY_MODE: "false"
-      RENDER_WORKERS: "4"
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true
-
+          lfs: ${{ needs.detect.outputs.kind == 'hyperframes' }}
+          fetch-depth: 1
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install HyperFrames
-        run: npm install -g hyperframes@0.8.223
-
-      - name: Ensure Render Browser
-        run: hyperframes browser ensure
-
-      - name: Render Chunk
+      - name: Ensure FFmpeg
         run: |
-          mkdir -p chunk_renders
-          SLUG="${{ matrix.slug }}"
-          QUALITY="${{ matrix.quality }}"
-          START="${{ matrix.start }}"
-          END="${{ matrix.end }}"
-          ID="${{ matrix.id }}"
-          OUT="chunk_renders/chunk_${SLUG}_${ID}.mp4"
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffmpeg -version | head -1
 
-          CMD="hyperframes render \"videos/$SLUG\" --workers 4 --quality \"$QUALITY\""
-          if [ -n "$START" ]; then
-            CMD="$CMD --start $START"
-          fi
-          if [ -n "$END" ]; then
-            CMD="$CMD --end $END"
-          fi
+      # ── canvas ────────────────────────────────────────────────────────────
+      - name: Extract canvas bundle
+        if: needs.detect.outputs.kind == 'canvas'
+        run: |
+          mkdir -p ep
+          tar -xzf "videos/${{ needs.detect.outputs.slug }}/bundle.tar.gz" -C ep
+          test -s ep/index.html
+      - name: Render canvas chunk ${{ matrix.id }}
+        if: needs.detect.outputs.kind == 'canvas'
+        working-directory: ep
+        env:
+          AR: ${{ needs.detect.outputs.ar }}
+          CRF: ${{ inputs.crf || '18' }}
+          WORKERS: ${{ needs.detect.outputs.workers }}
+        run: |
+          OUT="$RUNNER_TEMP/chunk_${{ matrix.id }}.mp4"
+          mkdir -p "$RUNNER_TEMP"
+          node tools/capture.mjs video "$OUT" "${{ matrix.start }}" "${{ matrix.end }}" "$WORKERS"
+          test -s "$OUT"
+          N=$(ffprobe -v error -select_streams v:0 -count_packets \
+                -show_entries stream=nb_read_packets -of csv=p=0 "$OUT")
+          N=${N//[^0-9]/}
+          echo "chunk ${{ matrix.id }}: $N / ${{ matrix.frames }} frames"
+          test "$N" = "${{ matrix.frames }}"
+          echo "CHUNK_PATH=$OUT" >> "$GITHUB_ENV"
+
+      # ── hyperframes ───────────────────────────────────────────────────────
+      - name: Install HyperFrames
+        if: needs.detect.outputs.kind == 'hyperframes'
+        run: |
+          npm install -g hyperframes@0.8.223
+          hyperframes browser ensure
+      - name: Render HyperFrames chunk ${{ matrix.id }}
+        if: needs.detect.outputs.kind == 'hyperframes'
+        env:
+          QUALITY: ${{ inputs.quality || 'delivery' }}
+          WORKERS: ${{ needs.detect.outputs.workers }}
+        run: |
+          OUT="$RUNNER_TEMP/chunk_${{ matrix.id }}.mp4"
+          mkdir -p "$RUNNER_TEMP"
+          CMD="hyperframes render \"videos/${{ needs.detect.outputs.slug }}\" --workers $WORKERS --quality $QUALITY"
+          if [ -n "${{ matrix.start }}" ]; then CMD="$CMD --start ${{ matrix.start }}"; fi
+          if [ -n "${{ matrix.end }}" ]; then CMD="$CMD --end ${{ matrix.end }}"; fi
           CMD="$CMD -o \"$OUT\""
-          echo "=== Executing: $CMD ==="
+          echo "=== $CMD"
           eval "$CMD"
           test -s "$OUT"
+          echo "CHUNK_PATH=$OUT" >> "$GITHUB_ENV"
 
-      - name: Upload Chunk Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: chunk-${{ matrix.slug }}-${{ matrix.id }}
-          path: chunk_renders/chunk_${{ matrix.slug }}_${{ matrix.id }}.mp4
-          retention-days: 1
+          name: chunk-${{ needs.detect.outputs.slug }}-${{ matrix.id }}
+          path: ${{ env.CHUNK_PATH }}
+          retention-days: 2
           if-no-files-found: error
 
-  merge-and-release:
-    needs: [find-targets, plan-chunks, render-chunk]
+  merge:
+    needs: [detect, render-chunk]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-      actions: write
-    strategy:
-      matrix: ${{ fromJson(needs.find-targets.outputs.matrix) }}
+    timeout-minutes: 60
+    env:
+      SLUG: ${{ needs.detect.outputs.slug }}
+      KIND: ${{ needs.detect.outputs.kind }}
+      OUTPUT: ${{ needs.detect.outputs.output }}
+      DURATION: ${{ needs.detect.outputs.duration }}
+      AR: ${{ needs.detect.outputs.ar }}
+      AUDIO: ${{ needs.detect.outputs.audio }}
+      SHARE: ${{ needs.detect.outputs.share }}
+      FRAMES: ${{ needs.detect.outputs.frames }}
+      COUNT: ${{ needs.detect.outputs.chunk_count }}
     steps:
-      # Full clone: the history purge below must rewrite ALL commits that ever
-      # touched the slug, not just the tip. LFS is not pulled — the stitcher
-      # needs no LFS content and this dodges LFS-quota failures.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           lfs: false
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Download Video Chunks
-        uses: actions/download-artifact@v4
+      - name: Ensure FFmpeg
+        run: |
+          command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffmpeg -version | head -1
+      - uses: actions/download-artifact@v4
         with:
-          pattern: chunk-${{ matrix.slug }}-*
+          pattern: chunk-${{ needs.detect.outputs.slug }}-*
           path: chunks_download
           merge-multiple: true
-
-      - name: Stitch & Verify Deliverable
-        run: |
-          mkdir -p output
-          SLUG="${{ matrix.slug }}"
-          CHUNKS="${{ needs.find-targets.outputs.chunks }}"
-          OUT="output/${SLUG}.mp4"
-
-          node tools/stitch-render-chunks.mjs "$SLUG" "$CHUNKS" "chunks_download" "$OUT"
-          test -s "$OUT"
-
-      - name: Upload Video Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rendered-video-${{ matrix.slug }}-${{ github.run_number }}
-          path: output/${{ matrix.slug }}.mp4
-          retention-days: 90
-          if-no-files-found: error
-
-      - name: Publish GitHub Release Deliverable
-        id: release
-        if: ${{ needs.find-targets.outputs.create_release != 'false' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: deliverable-${{ matrix.slug }}-${{ github.run_number }}
-          name: "Video Deliverable: ${{ matrix.slug }}"
-          body: |
-            ## RenderedLabs Master Video Deliverable
-            - **Slug:** `${{ matrix.slug }}`
-            - **Render Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            - **Commit:** `${{ github.sha }}`
-            - **Generated:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          files: output/${{ matrix.slug }}.mp4
-          draft: false
-          prerelease: false
-
-      - name: Erase staged sources + run artifacts
-        if: ${{ inputs.cleanup != false }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SLUG: ${{ matrix.slug }}
-          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+      - name: Stitch, master, share
         run: |
           set -euo pipefail
+          mkdir -p deliver
+          ls -lh chunks_download
 
-          # Guard: never erase anything unless the master MP4 is already secured
-          # as a Release asset. If the release was disabled for this run, skip
-          # cleanup and keep the artifacts; if it failed, fail loudly.
+          if [ "$KIND" = "canvas" ]; then
+            mkdir -p ep
+            tar -xzf "videos/$SLUG/bundle.tar.gz" -C ep
+            node tools/stitch-render-chunks.mjs "$SLUG" "$COUNT" chunks_download "$RUNNER_TEMP/silent.mp4"
+            test -s "ep/$AUDIO"
+            ffmpeg -y -loglevel error -i "$RUNNER_TEMP/silent.mp4" -i "ep/$AUDIO" \
+              -map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -t "$DURATION" \
+              -movflags +faststart "deliver/${OUTPUT}-master.mp4"
+
+            if [ "$SHARE" = "true" ]; then
+              if [ "$AR" = "9x16" ]; then SCALE="720:1280"; else SCALE="1280:720"; fi
+              ffmpeg -y -loglevel error -i "deliver/${OUTPUT}-master.mp4" \
+                -vf "scale=${SCALE}:flags=lanczos" \
+                -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
+                -c:a copy -movflags +faststart "deliver/${OUTPUT}-share.mp4"
+            fi
+
+            MASTER_FRAMES=$(ffprobe -v error -select_streams v:0 -count_packets \
+              -show_entries stream=nb_read_packets -of csv=p=0 "deliver/${OUTPUT}-master.mp4" | tr -dc '0-9')
+            echo "master frames: $MASTER_FRAMES / $FRAMES"
+            test "$MASTER_FRAMES" = "$FRAMES"
+            if [ "$SHARE" = "true" ]; then
+              SHARE_FRAMES=$(ffprobe -v error -select_streams v:0 -count_packets \
+                -show_entries stream=nb_read_packets -of csv=p=0 "deliver/${OUTPUT}-share.mp4" | tr -dc '0-9')
+              test "$SHARE_FRAMES" = "$FRAMES"
+            fi
+            ffmpeg -hide_banner -nostats -i "deliver/${OUTPUT}-master.mp4" -vn \
+              -af ebur128=peak=true -f null - 2>&1 | grep -A4 -E "Integrated loudness|True peak"
+          else
+            node tools/stitch-render-chunks.mjs "$SLUG" "$COUNT" chunks_download "deliver/${OUTPUT}.mp4"
+            test -s "deliver/${OUTPUT}.mp4"
+            ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "deliver/${OUTPUT}.mp4"
+          fi
+
+          echo "── deliverables ──"
+          ls -lh deliver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deliverable-${{ needs.detect.outputs.slug }}-${{ github.run_number }}
+          path: deliver/*.mp4
+          retention-days: 30
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        id: release
+        if: inputs.create_release != false
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: deliverable-${{ needs.detect.outputs.slug }}-${{ github.run_number }}
+          name: "Cloud master: ${{ needs.detect.outputs.slug }} #${{ github.run_number }}"
+          body: |
+            **Project:** `${{ needs.detect.outputs.slug }}`
+            **Renderer:** `${{ needs.detect.outputs.kind }}`
+            **Runners:** ${{ needs.detect.outputs.chunk_count }} × ${{ needs.detect.outputs.workers }} workers
+            **Duration:** `${{ needs.detect.outputs.duration }}` s
+            **Frames:** `${{ needs.detect.outputs.frames }}`
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: deliver/*.mp4
+          draft: false
+          prerelease: false
+      - name: Purge staged sources and artifacts
+        if: inputs.cleanup != false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          SLUG: ${{ needs.detect.outputs.slug }}
+        run: |
+          set -euo pipefail
           if [ "$RELEASE_OUTCOME" = "skipped" ]; then
-            echo "::notice::Release creation disabled for this run - skipping cleanup, run artifacts are kept."
+            echo "::notice::Release disabled - keeping staged sources and artifacts."
             exit 0
           fi
           if [ "$RELEASE_OUTCOME" != "success" ]; then
-            echo "::error::Release step outcome is '$RELEASE_OUTCOME' - master is NOT secured as a Release asset. Skipping cleanup so nothing is lost."
+            echo "::error::Release outcome '$RELEASE_OUTCOME' - master is not secured. Skipping cleanup."
             exit 1
           fi
 
-          # 1) Purge the staged project from the ENTIRE history (tip + every
-          #    commit that ever touched it) and force-push. Rewritten commits
-          #    are old history and the new tip contains no videos/** paths, so
-          #    this cannot re-trigger the workflow's paths filter — no [skip ci]
-          #    marker is needed on a rewrite. Staging commits therefore never
-          #    accumulate. filter-branch is used over filter-repo deliberately:
-          #    it is built into git, no remote-detach/pip dependency in CI.
           git config user.name "render-bot"
           git config user.email "bot@users.noreply.github.com"
           export FILTER_BRANCH_SQUELCH_WARNING=1
-          git filter-branch --force --index-filter "git rm -rf --cached --ignore-unmatch 'videos/${SLUG}'" --prune-empty --tag-name-filter cat -- --all
+          git filter-branch --force --index-filter \
+            "git rm -rf --cached --ignore-unmatch 'videos/${SLUG}'" \
+            --prune-empty --tag-name-filter cat -- --all
           git push --force origin main
           git push --force origin --tags || true
-          echo "History purged - staged sources for ${SLUG} are gone from every commit."
+          echo "History purged: videos/${SLUG} is gone from every commit."
 
-          # 2) Delete ALL artifacts of this run (chunks + master). The master is
-          #    safe: it was attached to the Release above.
-          echo "Deleting all artifacts of run ${{ github.run_id }} (master secured as a Release asset)..."
           for ARTIFACT_ID in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate -q '.artifacts[].id'); do
             echo "Deleting artifact ${ARTIFACT_ID}"
-            gh api --method DELETE "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}" \
-              && echo "Deleted artifact ${ARTIFACT_ID}"
+            gh api --method DELETE "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}" || true
           done
-          REMAINING=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate -q '.artifacts | length')
-          echo "Remaining artifacts for this run: ${REMAINING}"

@@ -1,97 +1,104 @@
-# RenderedLabs — Cloud Render Runner & Video Distribution Hub
+# render-cloud
 
-> **Public Render Pipeline & Delivery Hub for RenderedLabs.**  
-> Powered by GitHub Actions (unlimited free compute), HyperFrames, and automated release packaging.
+Public cloud render hub for the Studio channels. One GitHub Actions workflow
+renders both engines, with **20 runners × 4 workers** by default.
 
----
+| Engine | Project shape | Used by |
+|---|---|---|
+| **hyperframes** | `videos/<slug>/index.html` + `data-duration` | RenderedLabs, concept-carousel HyperFrames shorts |
+| **canvas** | `videos/<slug>/render.json` + `bundle.tar.gz` | Amber Margins, concept-carousel canvas shorts |
 
-## 1. Architecture & Purpose
-
-This repository operates in tandem with the private **RenderedLabs** production repository:
-- **Private Source (`RenderedLabs`):** All research dossiers, scripts, art direction, audio masters, and intellectual property remain private.
-- **Public Render Engine (`RenderedLabs-render`):** Mounted as a git submodule at `renders/` inside `RenderedLabs`. Staged video composition directories are rendered in the cloud via GitHub Actions using free, unlimited runner minutes.
-- **Delivery & Distribution:** Rendered `.mp4` master deliverables are uploaded as GitHub Actions artifacts and published as GitHub Releases with direct, high-bandwidth download links.
-
-```
-┌─────────────────────────────────┐
-│     RenderedLabs (Private)      │
-│  - Research, Scripts, Voice     │
-│  - Master Compositions          │
-└────────────────┬────────────────┘
-                 │ git submodule (renders/)
-                 ▼
-┌─────────────────────────────────┐
-│   RenderedLabs-render (Public)  │
-│  - videos/<slug>/ (staged)      │
-│  - .github/workflows/render.yml │
-│  - GitHub Actions Free Runners  │
-└────────────────┬────────────────┘
-                 │
-       ┌─────────┴─────────┐
-       ▼                   ▼
- Artifact Download   GitHub Release
- (MP4 Deliverable)  (Permanent Host)
-```
+Deliverables are attached to a GitHub Release, then the staged source is purged
+from every commit and the run artifacts are deleted. The public repo never keeps
+a project permanently.
 
 ---
 
-## 2. Cloud Render Workflow
+## Dispatch
 
-### Automatic Render on Push
-When a video directory is staged under `videos/<slug>/` and pushed to the `main` branch, the `.github/workflows/render.yml` workflow automatically starts rendering the newly added or updated video.
-
-### Manual Dispatch via GitHub Actions UI
-1. Navigate to **Actions** → **Render Video**.
-2. Click **Run workflow**.
-3. Enter:
-   - **Video slug**: The folder name under `videos/` (e.g. `baltic-gps-blackout-2026`), or `all`.
-   - **Quality**: `high` (broadcast master) or `draft` (rapid preview).
-   - **Create Release**: `true` (attaches the `.mp4` directly to a GitHub Release).
-
-### Dispatch via GitHub CLI (`gh`)
-From within `RenderedLabs`:
 ```bash
-# Render specific video in cloud
-gh workflow run render.yml -R Itsmeakash248/RenderedLabs-render -f slug=baltic-gps-blackout-2026 -f quality=high
-
-# Check status of cloud runs
-gh run list -R Itsmeakash248/RenderedLabs-render
-
-# Watch current run live
-gh run watch -R Itsmeakash248/RenderedLabs-render
-
-# Download the rendered video once finished
-gh run download <RUN_ID> -R Itsmeakash248/RenderedLabs-render -d output/
+gh workflow run render.yml -R Itsmeakash248/render-cloud \
+  -f slug=<slug> -f kind=auto -f chunks=20 -f workers=4
 ```
 
-### Integrated CLI Runner
-Inside `RenderedLabs`, use the companion tool:
-```bash
-# 1. Stage a video into the submodule and push
-node tools/cloud-render.mjs stage <slug>
+Inputs: `slug` (`auto` = folder touched by the last commit), `kind`
+(`auto|hyperframes|canvas`), `chunks` (1–20), `workers` (1–8), `quality`
+(hyperframes `delivery|draft`), `crf` (canvas master, default 18),
+`create_release`, `cleanup`.
 
-# 2. Trigger cloud render
-node tools/cloud-render.mjs dispatch <slug>
-
-# 3. Check progress
-node tools/cloud-render.mjs status
-
-# 4. Download deliverable to videos/<slug>/renders/
-node tools/cloud-render.mjs download <slug>
-```
+A push that adds or changes `videos/**` auto-dispatches with the defaults.
 
 ---
 
-## 3. Directory Layout
+## HyperFrames
 
+From the private production repo:
+
+```bash
+node tools/cloud-render.mjs stage <slug>     # copies videos/<slug> here
+node tools/cloud-render.mjs dispatch <slug>  # 20 runners
+node tools/cloud-render.mjs download <slug>  # release -> videos/<slug>/renders/
 ```
-.
-├── .github/
-│   └── workflows/
-│       └── render.yml       # GitHub Actions cloud rendering pipeline
-├── output/                  # Local and artifact staging for rendered MP4s
-├── tools/
-│   └── render-one.mjs       # Execution and verification harness
-├── videos/                  # Staged video project bundles
-└── package.json
+
+The staged project keeps its `index.html` and assets. The workflow reads
+`data-duration`, plans 20 time chunks, runs `hyperframes render --workers 4` on
+each runner, then stitches the chunks losslessly.
+
+---
+
+## Canvas
+
+A canvas project supplies `cloud.json` in its own folder:
+
+```json
+{
+  "output": "ino-tadataka",
+  "fps": 24,
+  "ar": "16x9",
+  "duration": 561.203,
+  "audio": "data/mix.m4a",
+  "share": true,
+  "include": [
+    "index.html", "src", "fonts", "assets",
+    "tools/capture.mjs", "data/lines.json", "data/words.json", "data/mix.m4a"
+  ]
+}
 ```
+
+Then:
+
+```bash
+node tools/stage-canvas.mjs /path/to/project <slug>
+gh workflow run render.yml -R Itsmeakash248/render-cloud \
+  -f slug=<slug> -f kind=canvas -f chunks=20 -f workers=4
+```
+
+`stage-canvas.mjs` tars the include list into `videos/<slug>/bundle.tar.gz`
+(opaque on the public repo), writes `render.json`, commits with `[skip ci]`,
+and pushes. The workflow extracts the bundle on each runner, renders frame-exact
+chunks with `tools/capture.mjs ... 4`, stitches the picture, muxes the AAC
+audio, and (if `share: true`) encodes a 720p share copy.
+
+Audio must already be compressed (m4a/mp3) and under ~50 MB; WAV masters stay
+local.
+
+---
+
+## Delivery
+
+Releases are tagged `deliverable-<slug>-<run_number>` and contain:
+
+- hyperframes: `<slug>.mp4`
+- canvas: `<output>-master.mp4`, `<output>-share.mp4`
+
+The merge job verifies frame counts and reports EBU R128 loudness before the
+release is published. Cleanup then force-pushes a history with `videos/<slug>`
+removed and deletes the run's artifacts.
+
+---
+
+## Local layout
+
+`/home/akash/Studio/render-cloud` is a normal standalone clone (it used to be
+the `renders/` submodule of `RenderedLabs`). The RenderedLabs tooling points at
+`../render-cloud`.
